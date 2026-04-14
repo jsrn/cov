@@ -9,30 +9,40 @@ const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 
-// Coverage for a single line: tracks the min and max hits across all DA entries.
-// A line with a ternary/inline branch may appear multiple times in the LCOV file.
 struct LineCoverage {
-    min: u64,
-    max: u64,
+    da_hits: Option<u64>,
+    // None means '-' (block never reached); Some(0) means reachable but not taken
+    branches: Vec<Option<u64>>,
 }
 
 impl LineCoverage {
-    fn new(hits: u64) -> Self {
-        Self { min: hits, max: hits }
-    }
-
-    fn update(&mut self, hits: u64) {
-        self.min = self.min.min(hits);
-        self.max = self.max.max(hits);
-    }
-
     fn color(&self) -> &'static str {
-        if self.max == 0 {
-            RED    // never executed
-        } else if self.min == 0 {
-            YELLOW // partially covered (some branches missed)
+        let any_hit = self.da_hits.map_or(false, |h| h > 0)
+            || self.branches.iter().any(|b| matches!(b, Some(h) if *h > 0));
+        let any_missed = self.da_hits.map_or(false, |h| h == 0)
+            || self.branches.iter().any(|b| !matches!(b, Some(h) if *h > 0));
+
+        if !any_missed {
+            GREEN
+        } else if any_hit {
+            YELLOW
         } else {
-            GREEN  // fully covered
+            RED
+        }
+    }
+
+    // Text shown in the hits column. Lines with branch data show each branch
+    // count separated by '/' (e.g. "4/-" or "1/3") so partial coverage is
+    // immediately readable. Lines with only a DA record show the raw count.
+    fn hits_display(&self) -> String {
+        if !self.branches.is_empty() {
+            self.branches
+                .iter()
+                .map(|b| b.map_or_else(|| "-".to_string(), |h| h.to_string()))
+                .collect::<Vec<_>>()
+                .join("/")
+        } else {
+            self.da_hits.unwrap_or(0).to_string()
         }
     }
 }
@@ -56,8 +66,11 @@ fn main() {
 
     let lines: Vec<&str> = source.lines().collect();
     let line_num_width = lines.len().to_string().len();
-    let max_hits = coverage.values().map(|c| c.max).max().unwrap_or(0);
-    let hits_width = max_hits.to_string().len().max(1);
+    let hits_width = coverage
+        .values()
+        .map(|c| c.hits_display().len())
+        .max()
+        .unwrap_or(1);
 
     for (i, line) in lines.iter().enumerate() {
         let line_num = i + 1;
@@ -66,7 +79,7 @@ fn main() {
                 let gutter = format!(
                     "{:>lw$}  {:>hw$}  \u{2502}  ",
                     line_num,
-                    cov.max,
+                    cov.hits_display(),
                     lw = line_num_width,
                     hw = hits_width
                 );
@@ -114,8 +127,8 @@ fn parse_lcov(lcov_path: &str, source_path: &str) -> HashMap<usize, LineCoverage
             current_file_matches = false;
         } else if current_file_matches {
             if let Some(data) = line.strip_prefix("DA:") {
+                // DA format: <line>,<hits>[,<checksum>]
                 if let Some((line_str, rest)) = data.split_once(',') {
-                    // DA format: <line>,<hits>[,<checksum>] — ignore optional checksum
                     let hits_str = rest.split(',').next().unwrap_or(rest);
                     if let (Ok(line_num), Ok(hits)) =
                         (line_str.parse::<usize>(), hits_str.parse::<u64>())
@@ -123,23 +136,27 @@ fn parse_lcov(lcov_path: &str, source_path: &str) -> HashMap<usize, LineCoverage
                         if line_num > 0 {
                             coverage
                                 .entry(line_num)
-                                .and_modify(|c| c.update(hits))
-                                .or_insert_with(|| LineCoverage::new(hits));
+                                .and_modify(|c| c.da_hits = Some(hits))
+                                .or_insert(LineCoverage { da_hits: Some(hits), branches: vec![] });
                         }
                     }
                 }
             } else if let Some(data) = line.strip_prefix("BRDA:") {
                 // BRDA format: <line>,<block>,<branch>,<taken>
-                // <taken> is '-' if the block was never reached, or a hit count
+                // taken is '-' if the containing block was never executed
                 let parts: Vec<&str> = data.splitn(4, ',').collect();
                 if parts.len() == 4 {
                     if let Ok(line_num) = parts[0].parse::<usize>() {
                         if line_num > 0 {
-                            let hits = if parts[3] == "-" { 0 } else { parts[3].parse::<u64>().unwrap_or(0) };
+                            let taken = if parts[3] == "-" {
+                                None
+                            } else {
+                                parts[3].parse::<u64>().ok()
+                            };
                             coverage
                                 .entry(line_num)
-                                .and_modify(|c| c.update(hits))
-                                .or_insert_with(|| LineCoverage::new(hits));
+                                .and_modify(|c| c.branches.push(taken))
+                                .or_insert(LineCoverage { da_hits: None, branches: vec![taken] });
                         }
                     }
                 }
@@ -168,7 +185,6 @@ fn matches_source(sf_path: &str, source_path: &str, source_canonical: Option<&Pa
         }
     }
 
-    // Handle relative vs absolute: check if one is a suffix of the other
     if sf_path.ends_with(source_path) || source_path.ends_with(sf_path) {
         return true;
     }
