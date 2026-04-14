@@ -128,6 +128,21 @@ fn parse_lcov(lcov_path: &str, source_path: &str) -> HashMap<usize, LineCoverage
                         }
                     }
                 }
+            } else if let Some(data) = line.strip_prefix("BRDA:") {
+                // BRDA format: <line>,<block>,<branch>,<taken>
+                // <taken> is '-' if the block was never reached, or a hit count
+                let parts: Vec<&str> = data.splitn(4, ',').collect();
+                if parts.len() == 4 {
+                    if let Ok(line_num) = parts[0].parse::<usize>() {
+                        if line_num > 0 {
+                            let hits = if parts[3] == "-" { 0 } else { parts[3].parse::<u64>().unwrap_or(0) };
+                            coverage
+                                .entry(line_num)
+                                .and_modify(|c| c.update(hits))
+                                .or_insert_with(|| LineCoverage::new(hits));
+                        }
+                    }
+                }
             }
         }
     }
